@@ -4,13 +4,13 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Diagnostics.Eventing.Reader;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using DevHome.Common.Services;
+using DevHome.Common.TelemetryEvents.RepositoryManagement;
 using DevHome.Common.Windows.FileDialog;
 using DevHome.Database.DatabaseModels.RepositoryManagement;
 using DevHome.Database.Services;
@@ -18,7 +18,7 @@ using DevHome.RepositoryManagement.Factories;
 using DevHome.RepositoryManagement.Models;
 using DevHome.RepositoryManagement.Services;
 using DevHome.SetupFlow.Common.Helpers;
-using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
+using DevHome.Telemetry;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Serilog;
@@ -63,10 +63,13 @@ public partial class RepositoryManagementMainPageViewModel : ObservableObject
     private string _filterText = string.Empty;
 
     [ObservableProperty]
-    private bool _areFilterAndSortEnabled;
+    private bool _areControlsEnabled;
 
     [ObservableProperty]
     private bool _shouldShowSourceControlSelection;
+
+    [ObservableProperty]
+    private bool _isNavigatedTo;
 
     public enum SortOrder
     {
@@ -101,11 +104,11 @@ public partial class RepositoryManagementMainPageViewModel : ObservableObject
             _sortTag = SortOrder.NameDescending;
         }
 
-        AreFilterAndSortEnabled = false;
+        AreControlsEnabled = false;
 
         UpdateDisplayedRepositories();
 
-        AreFilterAndSortEnabled = true;
+        AreControlsEnabled = true;
     }
 
     [RelayCommand]
@@ -114,15 +117,37 @@ public partial class RepositoryManagementMainPageViewModel : ObservableObject
         UpdateDisplayedRepositories();
     }
 
+    /// <summary>
+    /// Adds an repository on the computer to the database.
+    /// </summary>
+    /// <returns>An awitable Task</returns>
+    /// <remarks>If the repository is already in the database "IsHidden" is set to false.</remarks>
     [RelayCommand]
     public async Task AddExistingRepository()
     {
-        AreFilterAndSortEnabled = false;
+        AreControlsEnabled = false;
 
         var existingRepositoryLocation = await GetRepositoryLocationFromUser();
         if (existingRepositoryLocation.Equals(string.Empty, StringComparison.OrdinalIgnoreCase))
         {
             _log.Warning($"Repository in {nameof(AddExistingRepository)} is either empty.");
+            AreControlsEnabled = true;
+            return;
+        }
+
+        var repositoryName = Path.GetFileName(existingRepositoryLocation);
+        var maybeExistingRepository = _dataAccessService.GetRepository(repositoryName, existingRepositoryLocation);
+
+        if (maybeExistingRepository != null)
+        {
+            _dataAccessService.SetIsHidden(maybeExistingRepository, false);
+            var existingRepository = _allLineItems.FirstOrDefault(x => x.ClonePath.Equals(existingRepositoryLocation, StringComparison.OrdinalIgnoreCase)
+            && x.RepositoryName.Equals(repositoryName, StringComparison.OrdinalIgnoreCase));
+
+            existingRepository.IsHiddenFromPage = false;
+
+            UpdateDisplayedRepositories();
+            AreControlsEnabled = true;
             return;
         }
 
@@ -149,7 +174,7 @@ public partial class RepositoryManagementMainPageViewModel : ObservableObject
         var repositoryUrl = _enhanceRepositoryService.GetRepositoryUrl(existingRepositoryLocation);
         var configurationFileLocation = DscHelpers.GetConfigurationFileIfExists(existingRepositoryLocation);
         var newRepository = _dataAccessService.MakeRepository(
-            Path.GetFileName(existingRepositoryLocation),
+            repositoryName,
             existingRepositoryLocation,
             configurationFileLocation,
             repositoryUrl,
@@ -171,7 +196,7 @@ public partial class RepositoryManagementMainPageViewModel : ObservableObject
 
         UpdateDisplayedRepositories();
 
-        AreFilterAndSortEnabled = true;
+        AreControlsEnabled = true;
     }
 
     [RelayCommand]
@@ -183,39 +208,131 @@ public partial class RepositoryManagementMainPageViewModel : ObservableObject
     [RelayCommand]
     public async Task LoadRepositories()
     {
-        // TODO: Spinning progress ring when loading repositories.
-        AreFilterAndSortEnabled = false;
-        _allRepositoriesFromTheDatabase = _dataAccessService.GetRepositories();
-        _allRepositoriesFromTheDatabase = await AssignSourceControlId(_allRepositoriesFromTheDatabase);
+        IsNavigatedTo = true;
+        AreControlsEnabled = false;
 
-        var repositoriesWithCommits = GetRepositoryAndLatestCommitPairs(_allRepositoriesFromTheDatabase);
+        var tempLineItemsToDisplay = new List<RepositoryManagementItemViewModel>();
+        await Task.Run(async () =>
+        {
+            _allRepositoriesFromTheDatabase = _dataAccessService.GetRepositories();
+            _allRepositoriesFromTheDatabase = await AssignSourceControlId(_allRepositoriesFromTheDatabase);
 
-        _allLineItems.Clear();
-        LineItemsToDisplay.Clear();
+            var repositoriesWithCommits = GetRepositoryAndLatestCommitPairs(_allRepositoriesFromTheDatabase);
 
-        _allLineItems = ConvertToLineItems(repositoriesWithCommits);
-        LineItemsToDisplay = new(HideFilterAndSort(_allLineItems).Where(x => x.IsHiddenFromPage == false).ToList());
+            _allLineItems.Clear();
+            _allLineItems = ConvertToLineItems(repositoriesWithCommits);
+            tempLineItemsToDisplay = HideFilterAndSort(_allLineItems).Where(x => x.IsHiddenFromPage == false).ToList();
+        });
 
         ShouldShowSourceControlSelection = _experimentationService.IsFeatureEnabled("RepositoryManagementSourceControlSelector");
 
-        AreFilterAndSortEnabled = true;
+        LineItemsToDisplay.Clear();
+        LineItemsToDisplay = new(tempLineItemsToDisplay);
+
+        AreControlsEnabled = true;
+        IsNavigatedTo = false;
     }
 
+    /// <summary>
+    /// Removes the repository from the PC.
+    /// </summary>
+    /// <param name="repositoryLineItem">The line item acted upon.</param>
+    /// <returns>An awaitable Task</returns>
+    /// <remarks>Even with an update callback this method can't update _allLineItems.
+    /// This means a call to UpdateDisplayedRepositories won't change the UI because the line item
+    /// isn't removed from _lineItemsToDisplay.</remarks>
     [RelayCommand]
-    public void HideRepository(RepositoryManagementItemViewModel repository)
+    public async Task DeleteRepositoryAsync(RepositoryManagementItemViewModel repositoryLineItem)
     {
-        if (repository == null)
+        var repositoryName = repositoryLineItem.RepositoryName;
+        var clonePath = repositoryLineItem.ClonePath;
+        var deleteRepositoryConfirmationDialog = new ContentDialog()
+        {
+            XamlRoot = _window.Content.XamlRoot,
+            Title = _stringResource.GetLocalized("DeleteRepositoryDialogTitle", repositoryName, clonePath),
+            Content = _stringResource.GetLocalized("DeleteRepositoryDialogContent"),
+            PrimaryButtonText = _stringResource.GetLocalized("Yes"),
+            CloseButtonText = _stringResource.GetLocalized("Cancel"),
+        };
+
+        ContentDialogResult dialogResult = ContentDialogResult.None;
+
+        try
+        {
+            dialogResult = await deleteRepositoryConfirmationDialog.ShowAsync();
+        }
+        catch (Exception ex)
+        {
+            _log.Error(ex, $"Failed to open delete confirmation dialog.");
+
+            // Keep LineItemErrorEvent because the event did come from the line item.
+            TelemetryFactory.Get<ITelemetry>().Log(
+                "DevHome_RepositoryLineItem_Event",
+                LogLevel.Critical,
+                new RepositoryLineItemErrorEvent(nameof(DeleteRepositoryAsync), ex));
+        }
+
+        if (dialogResult != ContentDialogResult.Primary)
         {
             return;
         }
 
-        AreFilterAndSortEnabled = false;
-
-        repository.RemoveThisRepositoryFromTheList();
-        repository.IsHiddenFromPage = true;
+        AreControlsEnabled = false;
+        _allLineItems.Remove(repositoryLineItem);
         UpdateDisplayedRepositories();
+        AreControlsEnabled = true;
 
-        AreFilterAndSortEnabled = true;
+        try
+        {
+            var repository = _dataAccessService.GetRepository(repositoryName, clonePath);
+            if (repository is null)
+            {
+                _log.Warning($"The repository with name {repositoryName} and clone location {clonePath} is not in the database when it is expected to be there.");
+                TelemetryFactory.Get<ITelemetry>().Log(
+                    "DevHome_RepositoryLineItem_Event",
+                    LogLevel.Critical,
+                    new RepositoryLineItemEvent(nameof(DeleteRepositoryAsync)));
+            }
+            else
+            {
+                _dataAccessService.RemoveRepository(repository);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Fall through to removing files and folders.
+            _log.Error(ex, $"Error when removing the repository from the database.");
+            TelemetryFactory.Get<ITelemetry>().Log(
+                "DevHome_RepositoryLineItem_Event",
+                LogLevel.Critical,
+                new RepositoryLineItemErrorEvent(nameof(DeleteRepositoryAsync), ex));
+        }
+
+        try
+        {
+            _enhanceRepositoryService.RemoveTrackedRepository(clonePath);
+        }
+        catch (Exception ex)
+        {
+            _log.Error(ex, $"Error when removing the repository from tracking.");
+            TelemetryFactory.Get<ITelemetry>().Log(
+                "DevHome_RepositoryLineItem_Event",
+                LogLevel.Critical,
+                new RepositoryLineItemErrorEvent(nameof(DeleteRepositoryAsync), ex));
+        }
+
+        try
+        {
+            await Task.Run(() => RepositoryActionHelper.DeleteEverything(clonePath));
+        }
+        catch (Exception ex)
+        {
+            _log.Error(ex, $"Error when deleting the repository.");
+            TelemetryFactory.Get<ITelemetry>().Log(
+                "DevHome_RepositoryLineItem_Event",
+                LogLevel.Critical,
+                new RepositoryLineItemErrorEvent(nameof(DeleteRepositoryAsync), ex));
+        }
     }
 
     public RepositoryManagementMainPageViewModel(
@@ -235,6 +352,10 @@ public partial class RepositoryManagementMainPageViewModel : ObservableObject
         _experimentationService = experimentationService;
     }
 
+    /// <summary>
+    /// Updates Repository Management UI.
+    /// </summary>
+    /// <remarks>For the change to appear, make sure modifications are done to the view model.</remarks>
     private void UpdateDisplayedRepositories()
     {
         LineItemsToDisplay.Clear();
@@ -251,7 +372,12 @@ public partial class RepositoryManagementMainPageViewModel : ObservableObject
         foreach (var repositoryWithCommit in repositories)
         {
             var repository = repositoryWithCommit.Item1;
-            var lineItem = _factory.MakeViewModel(repository.RepositoryName, repository.RepositoryClonePath, repository.IsHidden);
+            var lineItem = _factory.MakeViewModel(
+                repository.RepositoryName,
+                repository.RepositoryClonePath,
+                repository.IsHidden,
+                UpdateDisplayedRepositories);
+
             lineItem.Branch = _enhanceRepositoryService.GetLocalBranchName(repository.RepositoryClonePath);
 
             var commit = repositoryWithCommit.Item2;

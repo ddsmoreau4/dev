@@ -126,8 +126,8 @@
     <comment>File filter example for chossing where to save a configuration file.</comment>
   </data>
   <data name="DeleteRepositoryDialogTitle" xml:space="preserve">
-    <value>Would you like to delete this repository?</value>
-    <comment>Message asking the user to confirm deleting the repository.</comment>
+    <value>Would you like to delete repository {0} at {1}</value>
+    <comment>{Locked="{0},{1}"} Message asking the user to confirm deleting the repository. {0} is the repository name. {1} is the clone location</comment>
   </data>
   <data name="DeleteRepositoryDialogContent" xml:space="preserve">
     <value>Deleting a repository means it will be permanently removed in File Explorer and from your PC.</value>
@@ -178,11 +178,11 @@
     <comment>Introduces the sorting combo box.</comment>
   </data>
   <data name="SortAlphabeticallyAscending.Content" xml:space="preserve">
-    <value>A to Z</value>
+    <value>Name: Ascending</value>
     <comment>Repositories are sorted from the beginning of the alphabet to the end.</comment>
   </data>
   <data name="SortAlphabeticallyDescending.Content" xml:space="preserve">
-    <value>Z to A</value>
+    <value>Name: Descending</value>
     <comment>Repositories are sorted from the end of the alphabet to the beginning.</comment>
   </data>
   <data name="NameHeader.Text" xml:space="preserve">
@@ -260,5 +260,13 @@
   <data name="ErrorAssigningSourceControlProvider" xml:space="preserve">
     <value>Error assigning source control provider</value>
     <comment>Title of the source control error dialog.</comment>
+  </data>
+  <data name="LoadingRepositories.Text" xml:space="preserve">
+    <value>Loading Repositories</value>
+    <comment>Label when Repotiroy Management is loading repositories.</comment>
+  </data>
+  <data name="Moving.Text" xml:space="preserve">
+    <value>Moving</value>
+    <comment>String to display when the repository is being moved.</comment>
   </data>
 </root>

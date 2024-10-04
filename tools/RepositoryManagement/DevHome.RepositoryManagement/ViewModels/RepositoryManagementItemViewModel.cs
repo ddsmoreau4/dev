@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -26,10 +27,6 @@ namespace DevHome.RepositoryManagement.ViewModels;
 
 public partial class RepositoryManagementItemViewModel : ObservableObject
 {
-    public const string EventName = "DevHome_RepositorySpecific_Event";
-
-    public const string ErrorEventName = "DevHome_RepositorySpecificError_Event";
-
     private readonly ILogger _log = Log.ForContext("SourceContext", nameof(RepositoryManagementItemViewModel));
 
     private readonly Window _window;
@@ -44,6 +41,8 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
 
     private readonly IExtensionService _extensionService;
 
+    private readonly Action _updateCallback;
+
     /// <summary>
     /// Gets the name of the repository.
     /// </summary>
@@ -57,9 +56,6 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
     /// <summary>
     /// Gets or sets the latest commit.  Nulls are converted to string.empty.
     /// </summary>
-    /// <remarks>
-    /// TODO: Test values are strings only.
-    /// </remarks>
     public string LatestCommit
     {
         get => _latestCommit ?? string.Empty;
@@ -101,12 +97,20 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
     public string SourceControlExtensionClassId { get; set; }
 
     [ObservableProperty]
+    private bool _enableAllOperationsExceptRunConfiguartion;
+
+    [ObservableProperty]
+    private bool _shouldShowMovingRepositoryProgressRing;
+
+    [ObservableProperty]
     private MenuFlyout _allSourceControlProviderNames;
 
     [RelayCommand]
     public void UpdateSourceControlProviderNames()
     {
-        AllSourceControlProviderNames.Items.Clear();
+        // Making a new MenuFlyout in the constructor throws an empty exception because
+        // the flyout is made in a non-UI thread.  Move the constructor here instead.
+        AllSourceControlProviderNames = new MenuFlyout();
         foreach (var extension in _extensionService.GetInstalledExtensionsAsync(ProviderType.LocalRepository).Result.ToList())
         {
             var menuItem = new MenuFlyoutItem
@@ -124,43 +128,40 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
     }
 
     [RelayCommand]
-    public async Task AssignRepositoryANewSourceControlProvider(IExtensionWrapper extensionWrapper)
+    public async Task AssignRepositoryANewSourceControlProviderAsync(IExtensionWrapper extensionWrapper)
     {
         if (!string.Equals(extensionWrapper.ExtensionClassId, SourceControlExtensionClassId, StringComparison.OrdinalIgnoreCase))
         {
             var result = await _repositoryEnhancerService.ReAssignSourceControl(ClonePath, extensionWrapper);
             if (result.Result != ResultType.Success)
             {
-                ShowErrorContentDialog(result);
+                ShowErrorContentDialogAsync(result);
             }
             else
             {
-                var repository = GetRepositoryReportIfNull(nameof(AssignRepositoryANewSourceControlProvider));
+                var repository = GetRepositoryReportIfNull(nameof(AssignRepositoryANewSourceControlProviderAsync));
                 _dataAccess.SetSourceControlId(repository, Guid.Parse(extensionWrapper.ExtensionClassId));
             }
         }
     }
 
     [RelayCommand]
-    public async Task OpenInFileExplorer()
+    public async Task OpenInFileExplorerAsync()
     {
-        await CheckCloneLocationNotifyUserIfNotFound();
-        OpenRepositoryInFileExplorer(RepositoryName, ClonePath, nameof(OpenInFileExplorer));
+        await CheckCloneLocationNotifyUserIfNotFoundAsync();
+        OpenRepositoryInFileExplorer(RepositoryName, ClonePath, nameof(OpenInFileExplorerAsync));
     }
 
     [RelayCommand]
-    public async Task OpenInCMD()
+    public async Task OpenInCMDAsync()
     {
-        await CheckCloneLocationNotifyUserIfNotFound();
-        OpenRepositoryinCMD(RepositoryName, ClonePath, nameof(OpenInCMD));
+        await CheckCloneLocationNotifyUserIfNotFoundAsync();
+        OpenRepositoryinCMD(RepositoryName, ClonePath, nameof(OpenInCMDAsync));
     }
 
     [RelayCommand]
-    public async Task MoveRepository()
+    public async Task MoveRepositoryAsync()
     {
-        // This action is not enabled due to a bug in FileExploreGitIntegration.
-        // FileExplorerGitIntegration holds a lock on a file in this repository and it can not
-        // be moved.
         var newLocation = await PickNewLocationForRepositoryAsync();
 
         if (string.IsNullOrEmpty(newLocation))
@@ -175,12 +176,34 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
             return;
         }
 
-        var newDirectoryInfo = new DirectoryInfo(Path.Join(newLocation, RepositoryName));
-        var currentDirectoryInfo = new DirectoryInfo(Path.GetFullPath(ClonePath));
+        var newClonePath = Path.Join(newLocation, RepositoryName);
 
         try
         {
-            currentDirectoryInfo.MoveTo(newDirectoryInfo.FullName);
+            EnableAllOperationsExceptRunConfiguartion = false;
+            ShouldShowMovingRepositoryProgressRing = true;
+
+            await Task.Run(() =>
+            {
+                // Store all file system entry attributes to restore after the move.
+                // FileSystem.MoveDirectory removes read-only attribute of files and folders.
+                Dictionary<string, FileAttributes> attributes = new();
+                foreach (var repositoryFile in Directory.GetFileSystemEntries(ClonePath, "*", SearchOption.AllDirectories))
+                {
+                    var theFullPath = Path.GetFullPath(repositoryFile);
+                    theFullPath = theFullPath.Replace(ClonePath, newClonePath);
+                    attributes.Add(Path.GetFullPath(theFullPath), File.GetAttributes(repositoryFile));
+                }
+
+                // Directory.Move does not move across drives.
+                Microsoft.VisualBasic.FileIO.FileSystem.MoveDirectory(ClonePath, newClonePath);
+
+                foreach (var newFile in Directory.GetFileSystemEntries(newClonePath, "*", SearchOption.AllDirectories))
+                {
+                    var fullPathToEntry = Path.GetFullPath(newFile);
+                    File.SetAttributes(fullPathToEntry, attributes[Path.GetFullPath(fullPathToEntry)]);
+                }
+            });
         }
         catch (Exception ex)
         {
@@ -188,109 +211,49 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
             TelemetryFactory.Get<ITelemetry>().Log(
                 "DevHome_RepositoryLineItem_Event",
                 LogLevel.Critical,
-                new RepositoryLineItemEvent(nameof(MoveRepository), RepositoryName));
+                new RepositoryLineItemEvent(nameof(MoveRepositoryAsync)));
         }
 
-        var repository = GetRepositoryReportIfNull(nameof(MoveRepository));
+        var repository = GetRepositoryReportIfNull(nameof(MoveRepositoryAsync));
         if (repository == null)
         {
             return;
         }
 
-        var didUpdate = _dataAccess.UpdateCloneLocation(repository, newDirectoryInfo.FullName);
+        var didUpdate = _dataAccess.UpdateCloneLocation(repository, newClonePath);
 
         if (!didUpdate)
         {
             _log.Error($"Could not update the database.  Check logs");
         }
 
-        ClonePath = Path.Join(newLocation, RepositoryName);
+        _repositoryEnhancerService.RemoveTrackedRepository(ClonePath);
+        await _repositoryEnhancerService.MakeRepositoryEnhanced(newClonePath, _repositoryEnhancerService.GetSourceControlProvider(SourceControlExtensionClassId));
+
+        try
+        {
+            RepositoryActionHelper.DeleteEverything(ClonePath);
+        }
+        catch (Exception ex)
+        {
+            _log.Error(ex, $"Could not remove all of {RepositoryName} from {ClonePath}.");
+        }
+
+        ClonePath = newClonePath;
+
+        ShouldShowMovingRepositoryProgressRing = false;
+        EnableAllOperationsExceptRunConfiguartion = true;
     }
 
     [RelayCommand]
-    public async Task DeleteRepositoryAsync()
+    public void HideRepository()
     {
-        // TODO: Add repository name and the location to the dialog.
-        // TODO: Ask user to type in the repository name before removing.
-        // This action is not enabled due to a bug in FileExploreGitIntegration.
-        // FileExplorerGitIntegration holds a lock on a file in this repository and it can not
-        // be moved.
-        var cantFindRepositoryDialog = new ContentDialog()
-        {
-            XamlRoot = _window.Content.XamlRoot,
-            Title = $"Would you like to delete this repository?",
-            Content = $"Deleting a repository means it will be permanently removed in File Explorer and from your PC.",
-            PrimaryButtonText = "Yes",
-            CloseButtonText = "Cancel",
-        };
-
-        ContentDialogResult dialogResult = ContentDialogResult.None;
-
-        try
-        {
-            dialogResult = await cantFindRepositoryDialog.ShowAsync();
-        }
-        catch (Exception ex)
-        {
-            _log.Error(ex, $"Failed to open confirmation dialog.");
-            TelemetryFactory.Get<ITelemetry>().Log(
-                "DevHome_RepositoryLineItem_Event",
-                LogLevel.Critical,
-                new RepositoryLineItemEvent(nameof(DeleteRepositoryAsync), RepositoryName));
-        }
-
-        if (dialogResult != ContentDialogResult.Primary)
-        {
-            return;
-        }
-
-        try
-        {
-            // Remove the repository.
-            // TODO: Check if this location is a repository and the name matches the repo name
-            // in path.
-            if (!string.IsNullOrEmpty(ClonePath)
-                && Directory.Exists(ClonePath))
-            {
-                // Cumbersome, but needed to remove read-only files.
-                foreach (var repositoryFile in Directory.EnumerateFiles(ClonePath, "*", SearchOption.AllDirectories))
-                {
-                    File.SetAttributes(repositoryFile, FileAttributes.Normal);
-                    File.Delete(repositoryFile);
-                }
-
-                foreach (var repositoryDirectory in Directory.GetDirectories(ClonePath, "*", SearchOption.AllDirectories).Reverse())
-                {
-                    Directory.Delete(repositoryDirectory);
-                }
-
-                File.SetAttributes(ClonePath, FileAttributes.Normal);
-                Directory.Delete(ClonePath, false);
-            }
-
-            var repository = GetRepositoryReportIfNull(nameof(DeleteRepositoryAsync));
-            if (repository == null)
-            {
-                // Do not warn the user here.  If the repository is not in the database
-                // the repository management page will not display the repository
-                // when entities are fetched.
-                return;
-            }
-
-            _dataAccess.RemoveRepository(repository);
-        }
-        catch (Exception ex)
-        {
-            _log.Error(ex, $"Error when deleting the repository.");
-            TelemetryFactory.Get<ITelemetry>().Log(
-                "DevHome_RepositoryLineItem_Event",
-                LogLevel.Critical,
-                new RepositoryLineItemEvent(nameof(DeleteRepositoryAsync), RepositoryName));
-        }
+        RemoveThisRepositoryFromTheList();
+        _updateCallback();
     }
 
     [RelayCommand]
-    public async Task MakeConfigurationFileWithThisRepository()
+    public async Task MakeConfigurationFileWithThisRepositoryAsync()
     {
         try
         {
@@ -304,7 +267,7 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
             if (!string.IsNullOrEmpty(fileName))
             {
                 var repositoryToUse = _dataAccess.GetRepository(RepositoryName, ClonePath);
-                var repository = GetRepositoryReportIfNull(nameof(MakeConfigurationFileWithThisRepository));
+                var repository = GetRepositoryReportIfNull(nameof(MakeConfigurationFileWithThisRepositoryAsync));
                 if (repository == null)
                 {
                     return;
@@ -340,6 +303,7 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
         processStartInfo.UseShellExecute = true;
         processStartInfo.FileName = "winget";
         processStartInfo.ArgumentList.Add("configure");
+        processStartInfo.ArgumentList.Add(configurationFileLocation);
         processStartInfo.Verb = "RunAs";
 
         StartProcess(processStartInfo, nameof(RunConfigurationFile));
@@ -352,7 +316,8 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
         IExtensionService extensionService,
         RepositoryEnhancerService repositoryEnhancerService,
         string repositoryName,
-        string cloneLocation)
+        string cloneLocation,
+        Action updateCallback)
     {
         _window = window;
         _dataAccess = dataAccess;
@@ -360,8 +325,9 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
         RepositoryName = repositoryName;
         _clonePath = cloneLocation;
         _extensionService = extensionService;
-        _allSourceControlProviderNames = new MenuFlyout();
         _repositoryEnhancerService = repositoryEnhancerService;
+        _updateCallback = updateCallback;
+        _enableAllOperationsExceptRunConfiguartion = true;
     }
 
     public void RemoveThisRepositoryFromTheList()
@@ -373,6 +339,7 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
         }
 
         _dataAccess.SetIsHidden(repository, true);
+        IsHiddenFromPage = true;
     }
 
     private void OpenRepositoryInFileExplorer(string repositoryName, string cloneLocation, string action)
@@ -381,7 +348,7 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
         TelemetryFactory.Get<ITelemetry>().Log(
             "DevHome_RepositoryLineItem_Event",
             LogLevel.Critical,
-            new RepositoryLineItemEvent(action, repositoryName));
+            new RepositoryLineItemEvent(action));
 
         var processStartInfo = new ProcessStartInfo
         {
@@ -401,7 +368,7 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
         TelemetryFactory.Get<ITelemetry>().Log(
             "DevHome_RepositoryLineItem_Event",
             LogLevel.Critical,
-            new RepositoryLineItemEvent(action, repositoryName));
+            new RepositoryLineItemEvent(action));
 
         var processStartInfo = new ProcessStartInfo
         {
@@ -420,7 +387,6 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
     {
         try
         {
-            // TODO: read stdout/stderror for errors in execution.
             Process.Start(processStartInfo);
         }
         catch (Exception e)
@@ -463,12 +429,12 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
         TelemetryFactory.Get<ITelemetry>().LogError(
         "DevHome_RepositoryLineItemError_Event",
         LogLevel.Critical,
-        new RepositoryLineItemErrorEvent(operation, ex.HResult, ex.Message, RepositoryName));
+        new RepositoryLineItemErrorEvent(operation, ex));
 
         _log.Error(ex, string.Empty);
     }
 
-    private async Task ShowCloneLocationNotFoundDialogAsync()
+    private async Task CloneLocationNotFoundNotifyUserAsync()
     {
         // strings need to be localized
         var cantFindRepositoryDialog = new ContentDialog()
@@ -493,7 +459,7 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
         }
         catch (Exception ex)
         {
-            SendTelemetryAndLogError(nameof(ShowCloneLocationNotFoundDialogAsync), ex);
+            SendTelemetryAndLogError(nameof(CloneLocationNotFoundNotifyUserAsync), ex);
         }
 
         // User will show DevHome where the repository is.
@@ -509,7 +475,7 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
                 return;
             }
 
-            var repository = GetRepositoryReportIfNull(nameof(ShowCloneLocationNotFoundDialogAsync));
+            var repository = GetRepositoryReportIfNull(nameof(CloneLocationNotFoundNotifyUserAsync));
 
             if (repository == null)
             {
@@ -528,6 +494,7 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
         else if (dialogResult == ContentDialogResult.Secondary)
         {
             RemoveThisRepositoryFromTheList();
+            _updateCallback();
             return;
         }
     }
@@ -535,17 +502,13 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
     private Repository GetRepositoryReportIfNull(string action)
     {
         var repository = _dataAccess.GetRepository(RepositoryName, ClonePath);
-
-        // The user clicked on this menu from the repository management page.
-        // The repository should be in the database.
-        // Somehow getting the repository returned null.
         if (repository is null)
         {
             _log.Warning($"The repository with name {RepositoryName} and clone location {ClonePath} is not in the database when it is expected to be there.");
             TelemetryFactory.Get<ITelemetry>().Log(
                 "DevHome_RepositoryLineItem_Event",
                 LogLevel.Critical,
-                new RepositoryLineItemEvent(action, RepositoryName));
+                new RepositoryLineItemEvent(action));
 
             return null;
         }
@@ -553,16 +516,16 @@ public partial class RepositoryManagementItemViewModel : ObservableObject
         return repository;
     }
 
-    private async Task CheckCloneLocationNotifyUserIfNotFound()
+    private async Task CheckCloneLocationNotifyUserIfNotFoundAsync()
     {
         if (!Directory.Exists(Path.GetFullPath(ClonePath)))
         {
             // Ask the user if they can point DevHome to the correct location
-            await ShowCloneLocationNotFoundDialogAsync();
+            await CloneLocationNotFoundNotifyUserAsync();
         }
     }
 
-    public async void ShowErrorContentDialog(SourceControlValidationResult result)
+    public async void ShowErrorContentDialogAsync(SourceControlValidationResult result)
     {
         var errorDialog = new ContentDialog
         {

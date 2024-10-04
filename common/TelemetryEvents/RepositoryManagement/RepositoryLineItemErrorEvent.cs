@@ -19,14 +19,11 @@ public class RepositoryLineItemErrorEvent : EventBase
 
     public string ErrorMessage { get; } = string.Empty;
 
-    public string RepositoryName { get; } = string.Empty;
-
-    public RepositoryLineItemErrorEvent(string action, int hresult, string errorMessage, string repositoryName)
+    public RepositoryLineItemErrorEvent(string action, Exception ex)
     {
         Action = action;
-        Hresult = hresult;
-        ErrorMessage = errorMessage;
-        RepositoryName = repositoryName;
+        Hresult = ex.HResult;
+        ErrorMessage = ex.Message;
     }
 
     public override void ReplaceSensitiveStrings(Func<string, string> replaceSensitiveStrings)

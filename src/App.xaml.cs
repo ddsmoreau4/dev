@@ -13,10 +13,10 @@ using DevHome.Contracts.Services;
 using DevHome.Customization.Extensions;
 using DevHome.Dashboard.Extensions;
 using DevHome.Database.Extensions;
+using DevHome.Database.Services;
 using DevHome.ExtensionLibrary.Extensions;
 using DevHome.Helpers;
 using DevHome.RepositoryManagement.Extensions;
-using DevHome.RepositoryManagement.ViewModels;
 using DevHome.Services;
 using DevHome.Services.Core.Extensions;
 using DevHome.Services.DesiredStateConfiguration.Extensions;
@@ -84,7 +84,6 @@ public partial class App : Application, IApp
 
     public App()
     {
-        // TODO: Add database migration.
         InitializeComponent();
 #if DEBUG_FAILFAST
         DebugSettings.FailFastOnErrors = true;
@@ -189,6 +188,19 @@ public partial class App : Application, IApp
 
         UnhandledException += App_UnhandledException;
         AppInstance.GetCurrent().Activated += OnActivated;
+
+        var databaseMigrator = Host.GetService<DatabaseMigrationService>();
+        if (databaseMigrator.ShouldMigrateDatabase())
+        {
+            try
+            {
+                databaseMigrator.MigrateDatabase();
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"Could not migrate the database");
+            }
+        }
 
         TelemetryFactory.Get<ITelemetry>().Log("DevHome_Started_Event", LogLevel.Critical, new DevHomeStartedEvent());
         Log.Information("Dev Home Started.");

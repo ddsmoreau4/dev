@@ -3,27 +3,29 @@
 
 using System;
 using System.IO;
-using System.Linq.Expressions;
+using DevHome.Common.Helpers;
 using DevHome.Common.TelemetryEvents.DevHomeDatabase;
+using DevHome.Database.Configurations;
 using DevHome.Database.DatabaseModels.RepositoryManagement;
+using DevHome.Database.Services;
 using DevHome.Telemetry;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Serilog;
+using Windows.Storage;
 
 namespace DevHome.Database;
 
+// TODO: Add documentation around migration and Entity Framework in DevHome.
+
 /// <summary>
-/// To make the database please run the following in Package Manager Console
-/// Update-Database -StartupProject DevHome.Database -Project DevHome.Database
-///
-/// TODO: Remove this comment after database migration is implemeneted.
-/// TODO: Set up Github detection for files in this project.
-/// TODO: Add documentation around migration and Entity Framework in DevHome.
+/// Provides access to the database for DevHome.
 /// </summary>
-public class DevHomeDatabaseContext : DbContext
+public class DevHomeDatabaseContext : DbContext, IDevHomeDatabaseContext
 {
-    private const string DatabaseFileName = "DevHome.db";
+    // Increment when the schema has changed.
+    // Should incremenet once per release.
+    public uint SchemaVersion => 1;
 
     private readonly ILogger _log = Log.ForContext("SourceContext", nameof(DevHomeDatabaseContext));
 
@@ -33,35 +35,36 @@ public class DevHomeDatabaseContext : DbContext
 
     public DevHomeDatabaseContext()
     {
-        // TODO: How to run the DevHome in VS and not have the file move to the per app location.
-        DbPath = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), DatabaseFileName);
+        if (RuntimeHelper.IsMSIX)
+        {
+            DbPath = Path.Join(ApplicationData.Current.LocalFolder.Path, "DevHome.db");
+        }
+        else
+        {
+#if CANARY_BUILD
+            var databaseFileName = "DevHome_Canary.db";
+#elif STABLE_BUILD
+            var databaseFileName = "DevHome.db";
+#else
+            var databaseFileName = "DevHome_dev.db";
+#endif
+            DbPath = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), databaseFileName);
+        }
+    }
+
+    public DevHomeDatabaseContext(string dbPath)
+    {
+        DbPath = dbPath;
     }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
-        // TODO: Use ServiceExtensions as an example to set up individual
-        // models using fluent API.  Currently, not needed, but will as this method
-        // will expand as more entities are added.
-        // If that is too much work these definitions can be placed inside the C# class.
         try
         {
-            // TODO: How to update "UpdatedAt"?
-            var repositoryEntity = modelBuilder.Entity<Repository>();
-            if (repositoryEntity != null)
-            {
-                repositoryEntity.Property(x => x.ConfigurationFileLocation).HasDefaultValue(string.Empty);
-                repositoryEntity.Property(x => x.RepositoryClonePath).HasDefaultValue(string.Empty).IsRequired(true);
-                repositoryEntity.Property(x => x.RepositoryName).HasDefaultValue(string.Empty).IsRequired(true);
-                repositoryEntity.Property(x => x.CreatedUTCDate).HasDefaultValueSql("datetime()");
-                repositoryEntity.Property(x => x.UpdatedUTCDate).HasDefaultValueSql("datetime()");
-                repositoryEntity.Property(x => x.RepositoryUri).HasDefaultValue(string.Empty);
-                repositoryEntity.Property(x => x.SourceControlClassId).HasDefaultValue(Guid.Empty);
-                repositoryEntity.ToTable("Repository");
-            }
+            new RepositoryConfiguration().Configure(modelBuilder.Entity<Repository>());
         }
         catch (Exception ex)
         {
-            // TODO: Notify user the database could not initialize.
             _log.Error(ex, "Can not build the database model");
             TelemetryFactory.Get<ITelemetry>().Log(
                 "DevHome_DatabaseContext_Event",
@@ -73,5 +76,10 @@ public class DevHomeDatabaseContext : DbContext
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
     {
         optionsBuilder.UseSqlite($"Data Source={DbPath}");
+    }
+
+    public EntityEntry Add(Repository repository)
+    {
+        return Repositories.Add(repository);
     }
 }
